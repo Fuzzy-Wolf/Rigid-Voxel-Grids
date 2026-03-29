@@ -1,0 +1,17 @@
+# SCsub
+
+Import('env')
+
+env_cpp20 = env.Clone()
+
+if "-std=gnu++17" in env_cpp20["CXXFLAGS"]:
+    env_cpp20["CXXFLAGS"].remove("-std=gnu++17")
+env_cpp20.Append(CXXFLAGS=["-std=gnu++20"])
+
+
+env_cpp20.Append(CXXFLAGS=["-pthread"])
+
+env_cpp20.add_source_files(env_cpp20.modules_sources, "*.cpp") # Add all cpp files to the build
+env_cpp20.add_source_files(env_cpp20.modules_sources, "src/*.cpp") # Add all cpp files to the build
+env_cpp20.add_source_files(env_cpp20.modules_sources, "src/meta/*.cpp") # Add all cpp files to the build
+env_cpp20.add_source_files(env_cpp20.modules_sources, "src/world/*.cpp") # Add all cpp files to the build

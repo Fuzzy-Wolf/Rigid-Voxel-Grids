@@ -1,0 +1,17 @@
+CompileFlags:
+  Add:
+    - -std=c++20
+    - -Wno-unneeded-internal-declaration
+    - -Wno-unused-const-variable
+    - -Wno-unused-function
+    - -Wno-unused-variable
+    - -Wall
+    - -Wextra
+    - -Wpedantic
+    - -Wshadow
+    - -Wformat=2
+    - -Wcast-align
+    - -Wconversion
+    - -Wsign-conversion
+    - -Wnull-dereference
+    - -fsanitize=address,undefined

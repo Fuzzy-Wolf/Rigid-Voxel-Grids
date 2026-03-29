@@ -1,0 +1,1608 @@
+
+
+
+
+inline const ShapeHolder* find_shape_holder(const RID first_shape) const {
+        for (ShapeHolder& shape : shape_holders) {
+            if (shape.get_first_shape_rid() == first_shape) {
+                return &shape;
+            }
+        }
+        return nullptr;
+    }
+    inline const ShapeHolder* find_shape_holder(const PGKoords closest_PG_pos) const {
+        for (const ShapeHolder& shape : shape_holders) {
+            if (shape.get_koords() == closest_PG_pos) {
+                return &shape;
+            }
+        }
+        return nullptr;
+    }
+
+
+
+
+
+
+/**
+ * @brief Interface für Tasks.
+ */
+template <typename Task_Data_in, typename Task_Data_out>
+class TaskInOut {
+    virtual void _task() = 0;
+
+public:
+    using Data_in = Task_Data_in;
+    using Data_out = Task_Data_out;
+
+    ThreadDataTransmitter<Data_in> pipeline_inside;
+    ThreadDataTransmitter<Data_out> pipeline_outside;
+
+    const uint thread_id;
+
+    void operator()() {
+        _task();
+        
+        this->pipeline_outside.renew_container();
+        this->pipeline_inside.renew_container();
+    } // TODO: da ich Templates und concepts nutze sollte das virtual nicht nötig sein. Wenn virtual, dann sollte keine Template mehr für den Task genutzt werden!
+    TaskInOut() = delete;
+    TaskInOut(const uint id) : thread_id(id) {}
+};
+
+
+
+
+
+struct RepeatingTasks {
+    template<typename UpdateData>
+    using RadiusUpdateFunc = void (std::vector<UpdateData>&, ChunkKoords, VoxelGrid*);
+
+    template <typename UpdateData>
+    using VolumeUpdateFunc = void (); // TODO: !!
+    // template<typename UpdateData>
+    // using MeshUpdateFunc = UpdateData* (short, short, short, const VoxelGrid*);
+
+    static void create_mesh(std::vector<ServerIntervention::CreateMesh> &vec,
+        ChunkKoords chunk_koords, VoxelGrid *voxel_grid)
+    {
+        const auto cb = ChunkBuilder::get_singleton();
+        const auto game = LocalGame::get_singleton();
+        const ChunkContent *chunk_content = game->get_chunk(chunk_koords, voxel_grid->get_instance_id());
+
+        if (chunk_content && chunk_content->voxels) {
+            //TODO: Transform korrekt berechnen!
+            const Vector3 pos = chunk_koords * CHUNK_SIZE * VOXEL_SIZE;
+            vec.emplace_back(ServerIntervention::CreateMesh{
+                    cb->generate_mesh_data(chunk_content->voxels),
+                    chunk_content->get_mesh(),
+                    chunk_content->get_instance(),
+                    Transform3D{ Basis(), pos }
+            });
+        }
+    }
+    static void delete_mesh(std::vector<ServerIntervention::CreateLOD1> &vec,
+        ChunkKoords chunk_koords, VoxelGrid *voxel_grid)
+    {
+        const auto game = LocalGame::get_singleton();
+        const ChunkContent *chunk_content = game->get_chunk(chunk_koords, voxel_grid->get_instance_id());
+
+        if (chunk_content) {
+            vec.emplace_back(ServerIntervention::CreateLOD1{
+                chunk_content->get_mesh() });
+        }
+    }
+    // static void change_mesh_to_LOD1() {
+    // }
+    // static void load_chunk_with_content(std::vector<ServerIntervention::LoadChunk> &vec,
+    //     ChunkKoords chunk_koords, VoxelGrid *voxel_grid)
+    // {
+    //     voxel_grid->load_chunk_with_content_from_disk(vec, chunk_koords);
+    // }
+    static void load_chunks_with_voxles_from_disk(std::vector<ServerIntervention::LoadChunk> &vec,
+        ChunkKoords chunk_koords, VoxelGrid *voxel_grid)
+    {
+        // const auto cb = ChunkBuilder::get_singleton();
+        ChunkMemoryUnit chunks = voxel_grid->load_chunks_with_voxels_from_disk(chunk_koords);
+        // TODO: hier passiert nichts auf dem MainThread... stimmt das?
+        /*
+        for (ChunkContent*& content : chunks) {
+            if (content) {
+                vec.emplace_back(
+                    ServerIntervention::LoadChunk{}
+                );
+            }
+        }
+        */
+    }
+    static void load_chunk_and_create_LOD(std::vector<ServerIntervention::LoadChunk> &vec,
+        ChunkKoords chunk_koords, VoxelGrid *voxel_grid)
+    {
+        // const auto cb = ChunkBuilder::get_singleton();
+        ChunkMemoryUnit chunks = voxel_grid->load_chunks_from_disk(chunk_koords);
+        for (ChunkContent*& content : chunks) {
+            if (content) {
+                //TODO: create LOD!
+            }
+        }
+    }
+    static void remove_chunk_and_save_to_disk(std::vector<ServerIntervention::UnLoadChunk> &vec,
+        ChunkKoords chunk_koords, VoxelGrid *voxel_grid)
+    {
+        // remove:
+        ChunkKey key{ chunk_koords, voxel_grid->get_instance_id()};
+        const ChunkContent *chunk_content = LocalGame::get_singleton()->get_chunk(key);
+        if (chunk_content) {
+            vec.emplace_back(ServerIntervention::UnLoadChunk{ key , chunk_content->get_instance() });
+        }
+        // save:
+        voxel_grid->queue_chunk_save_to_disk(chunk_koords);
+        // TODO: hier kommt evtl. nochwas... 
+    }
+    static void generate_collision_PG_box(std::vector<ServerIntervention::CreateCollision> &vec, PGKoords closest_PG_pos, VoxelGrid *voxel_grid) {
+        const auto cb = ChunkBuilder::get_singleton();
+        BoxShapeContainer shapes = cb->generate_collision_shapes(closest_PG_pos, voxel_grid);
+        if (!shapes.empty()) {
+            vec.emplace_back(ServerIntervention::CreateCollision{
+                closest_PG_pos,
+                voxel_grid,
+                shapes
+            });
+        }
+    }
+};
+
+
+
+
+
+
+
+
+
+VG::Chunk::Chunk() noexcept
+        : _rids(ChunkRIDs{
+        RenderingServer::get_singleton()->instance_create(),
+        RenderingServer::get_singleton()->mesh_create()})
+{
+    const auto game = LocalGame::get_singleton();
+    const auto rs = RenderingServer::get_singleton();
+
+    rs->instance_set_base(_rids.mesh_instance_rid, _rids.mesh_rid);
+    rs->instance_set_scenario(_rids.mesh_instance_rid, game->get_draw_scenario());
+}
+
+
+// VG::Chunk::Chunk() noexcept
+//         : mesh_instance_rid(RenderingServer::get_singleton()->instance_create()),
+//           mesh_rid(RenderingServer::get_singleton()->mesh_create()),
+//           physics_body_rid(PhysicsServer3D::get_singleton()->body_create())
+// {
+//     const auto game = LocalGameInstance::singleton;
+//     const auto rs = RenderingServer::get_singleton();
+//     // const auto ps = PhysicsServer3D::get_singleton();
+
+//     rs->instance_set_base(mesh_instance_rid, mesh_rid);
+//     rs->instance_set_scenario(mesh_instance_rid, game->get_draw_scenario());
+    
+//     col_shapes = {};
+// }
+
+
+
+
+
+// void VG::Chunk::initialize_chunk(const Vector3i& local_koords) {
+//     /*
+//         //Nachbarüberprüfung
+//         for (const auto &tup : AktiveChunks::singleton->_chunks) { // TODO: Koordinate abfragen und nicht alle durch itterieren (Ich brauch die ja nicht einmal mehr speichern... aber was ist mit dem Rand der Aktiven Chunks... da sind nicht_aktive_Nachbarn...)
+//             const auto &chunk = tup.second;
+//             if ((chunk->pos.x == pos.x) & (chunk->pos.y == pos.y + 1) & (chunk->pos.z == pos.z)) {
+//                 NEIGHBOR.top = chunk.get();
+//                 // chunk->NEIGHBOR.bottom = this;
+//             } else if ((chunk->pos.x == pos.x) & (chunk->pos.y == pos.y - 1) & (chunk->pos.z == pos.z)) {
+//                 NEIGHBOR.bottom = chunk.get();
+//                 // chunk->NEIGHBOR.top = this;
+//             } else if ((chunk->pos.x == pos.x + 1) & (chunk->pos.y == pos.y) & (chunk->pos.z == pos.z)) {
+//                 NEIGHBOR.east = chunk.get();
+//                 // chunk->NEIGHBOR.west = this;
+//             } else if ((chunk->pos.x == pos.x - 1) & (chunk->pos.y == pos.y) & (chunk->pos.z == pos.z)) {
+//                 NEIGHBOR.west = chunk.get();
+//                 // chunk->NEIGHBOR.east = this;
+//             } else if ((chunk->pos.x == pos.x) & (chunk->pos.y == pos.y) & (chunk->pos.z == pos.z + 1)) {
+//                 NEIGHBOR.south = chunk.get();
+//                 // chunk->NEIGHBOR.north = this;
+//             } else if ((chunk->pos.x == pos.x) & (chunk->pos.y == pos.y) & (chunk->pos.z == pos.z - 1)) {
+//                 NEIGHBOR.north = chunk.get();
+//                 // chunk->NEIGHBOR.south = this;
+//             }
+//         }
+//     */
+//     // ChunkBuilder& cb = *ChunkBuilder::singleton;
+//     // if (!mesh_instance) {
+//     //     cb.generate_mesh(*data,local_koords, body_data->world3D, body_data->voxel_material);
+//     // }
+//     // if (box_collision_shapes.empty()) {       
+//     //     cb.generate_collision(local_koords,*data);
+//     // }
+// }
+
+
+void VG::Chunk::delete_data() {
+    _is_free = true;
+    has_change_since_load = false;
+
+    koords = ChunkKoords{0,0,0};
+    grid_id = static_cast<uint64_t>(-1);
+
+    delete voxels;
+    voxels = nullptr;
+}
+
+
+
+
+
+template <size_t SIZE>
+class ChunkMap {
+    static_assert(MAX_GRID_SIZE*2 < SIZE); // siehe 'next_idx'
+    friend struct UnLoadData;
+
+    static constexpr ushort SEARCH_DEPTH = 13;
+    static constexpr ushort TRYS = 20;
+    size_t _occupancy = 0;
+    
+    std::array<Chunk, SIZE> chunks{};
+    
+    inline static size_t hash(const ChunkKey& key) {
+        size_t id_hash = std::hash<size_t>{}(key.grid_id);
+        auto pre_hash = static_cast<size_t>(
+              key.koords.x * SEARCH_DEPTH
+            + key.koords.y * MAX_GRID_SIZE
+            + key.koords.z * MAX_GRID_SIZE * MAX_GRID_SIZE)
+            ^ id_hash;
+        return (pre_hash + (pre_hash==0)) % SIZE; // TODO(erledigt! ich lass es trotzdem mal noch stehen...): "Remainder by zero is undefined" vieleicht muss ich das verbessern
+    }
+
+    // TODO: Was ist besser:
+    //      - kein Clustering
+    //      - Chash-optimiert, aber mit möglicher Clusterbildung
+    // TODO: Messe Kollisionen -> ERR_PRINT_ED wenn Kollision oder Counter
+    inline static void next_idx(ushort &count, size_t &idx, const ChunkKey &key) {
+        count += 1;
+        idx += static_cast<size_t>(count * 2 + key.koords.y);
+        idx %= SIZE;
+    }
+    // inline static void next_idx_simple(ushort &count, size_t &idx, const ChunkKey &key) {
+    //     count += 1;
+    //     idx += 1;
+    //     if (unlikely(SIZE <= idx)) {
+    //         idx -= SIZE;
+    //     }
+    // }
+
+public:
+    //TODO: entferne diesen Rotz!
+    String msg = "";
+
+    inline double get_occupancy_rate() {
+        return static_cast<double>(_occupancy) / static_cast<double>(SIZE);
+    }
+
+    Chunk *get(const ChunkKey &key) {
+        ushort count = 0;
+        size_t idx = hash(key);
+        while (count < SEARCH_DEPTH) {
+            if (key == chunks[idx] && !chunks[idx].is_free()) {
+                return &chunks[idx];
+            }
+            next_idx(count, idx, key);
+        }
+        return nullptr;
+    }
+
+    Chunk steal(const ChunkKey &key) {
+        Chunk *chunk = get(key);
+        if (chunk) {
+            _occupancy -= 1;
+            chunk->free();
+        }
+        return *chunk;
+    }
+    void remove(const ChunkKey &key) {
+        Chunk *chunk = get(key);
+        if (chunk) {
+            _occupancy -= 1;
+            chunk->free();
+        }
+    }
+
+    void remove(Chunk *chunk) {
+        ERR_FAIL_COND_MSG(chunk->is_free(), "Chunk ist bereits gelöscht!");
+        _occupancy -= 1;
+        chunk->free();
+    }
+
+    Chunk *push(ChunkKey &&key) {
+        msg = "";
+        // TODO: dieser Teil erstmal ein workaround und zum sicher gehen:
+        if (SIZE * 0.8 < _occupancy) {
+            return nullptr; // mehr als 80% sollte nicht befüllt werden
+        }
+        // // überprüfen ob Chunk breits geladen ist
+        // if (auto r = get(key)) {
+        //     return r; // TODO: sollte vor 'push' geprüft werden
+        // }
+        
+        // key zu index auflösen
+        size_t idx = hash(key);
+        // merke den ersten index, beim Scheitern wird diese Var. genutzt um das zuverschiebene Element zu bestimmen
+        size_t move_idx = idx;
+        // nutze loop um 'SEARCH_DEPTH' viele Kollisionen aufzulösen
+        ushort count = 0;
+        while (count < SEARCH_DEPTH) {
+            if (chunks[idx].is_free()) {
+                chunks[idx] << key;
+                _occupancy += 1;
+                return &chunks[idx];
+            }
+            next_idx(count, idx, key);
+        }
+        // Wenn nach 'SEARCH_DEPTH' Kollisionen kein Platz gefunden wurde: Chunk austauschen und neu Versuchen (hierbei MÜSSEN RIDs getauscht werden!! )
+        msg = "Oh Nyo! Es hat nicht geklappt OwO'";
+        // Daten des zu überschreibenen Chunks kopieren
+        Chunk moving_chunk{chunks[move_idx]};
+        // Chunk, der keinen Platz gefunden hat, einsetzen (RIDs fehlen hier noch!)
+        chunks[move_idx] << key;
+        // Funktion wiederholen, jetzt mit herausgepflückten Chunk, zurück kommen die freien RIDs
+        // nutze rekursion um mehrere Versuche einen Chunk-unter-zu-bringen durchzuführen
+        ChunkRIDs rids = push_rekursiv(moving_chunk, 0);
+
+        chunks[move_idx].override_rids(rids);
+
+        return &chunks[idx];
+    }
+
+    ChunkRIDs push_rekursiv(const Chunk& chunk, ushort number_of_try) {
+        ChunkKey key = chunk.get_key();
+        // key zu index auflösen
+        size_t idx = hash(key);
+
+        // merke hier nicht mehr den ersten index sondern "Anzahl an Versuchen" weiter, damit kein unendliches hin-und-her tauschen von 2 Elemetnen entsteht.
+        size_t move_idx = idx;
+        for (int i = 0; i <= number_of_try; ++i) {
+            next_idx(number_of_try, move_idx, key);
+        }
+        // nutze loop um 'SEARCH_DEPTH' viele Kollisionen aufzulösen
+        ushort count = 0;
+        while (count < SEARCH_DEPTH) {
+            if (chunks[idx].is_free()) {
+                ChunkRIDs new_rids = chunks[idx].get_rids();
+                if (chunk.get_voxels()) {
+                    chunks[idx] << chunk.get_voxels();
+                }
+                chunks[idx] << key;
+                chunks[idx].override_rids(chunk.get_rids());
+                _occupancy += 1;
+                return new_rids;
+            }
+            next_idx(count,idx,key);
+        }
+        // Wenn nach 'SEARCH_DEPTH' Kollisionen kein Platz gefunden wurde: Chunk austauschen und neu Versuchen (hierbei MÜSSEN RIDs getauscht werden!! )
+        msg = "Nyoooo! Es hat schon WIEDER nicht geklappt OwO'";
+        // Daten des zu überschreibenen Chunks kopieren
+        Chunk moving_chunk{chunks[move_idx]};
+        // Chunk, der keinen Platz gefunden hat, einsetzen
+        chunks[move_idx] << chunk.get_voxels();
+        chunks[move_idx] << key;
+        chunks[move_idx].override_rids(chunk.get_rids());
+
+        // Funktion wiederholen, jetzt mit herausgepflückten Chunk, zurück kommen die freien RIDs
+        ChunkRIDs rids = push_rekursiv(moving_chunk, number_of_try);
+
+        return rids;
+    }
+};
+
+
+
+
+
+
+template <size_t SIZE> class ChunkMap;
+
+class Chunk {
+    friend class ChunkBuilder;
+    friend class ChunkMap<AKTIVE_CHUNKS_STORAGE_SIZE>;
+    
+    friend inline bool operator==(const ChunkKey &key, const Chunk &chunk);
+    friend inline void operator<<(ChunkKey& key, const Chunk& chunk);
+
+private:
+    
+    uint64_t grid_id = static_cast<uint64_t>(-1);
+    bool has_change_since_load = false;
+    std::atomic_bool _is_free = true; // TODO: nicht hier in 'Chunk' -> use Bit-Array am anfang der 'ChunkMap' [Searchdepth=32] erste Null ist der Freie Platz (TOTAL Overengeneered, also erstmal nicht machen!!!)
+    ChunkRIDs _rids;
+
+    inline void free() {
+        //TODO: damite es sinnvoll ist, dass data stehen bleibt muss beim "pushen" in 'ChunkMap' überprüft werden, ob dieser Platz bereit vorher von chunk besetzt wurde.
+        _is_free.store(true,std::memory_order_release);
+    }
+    
+public:
+    VoxelData *voxels = nullptr;
+    ChunkKoords koords;
+    
+    /*const struct {
+        mutable const Chunk *top = nullptr;
+        mutable const Chunk *bottom = nullptr;
+        mutable const Chunk *east = nullptr;
+        mutable const Chunk *west = nullptr;
+        mutable const Chunk *south = nullptr;
+        mutable const Chunk *north = nullptr;
+    } NEIGHBOR{};*/
+    //------------------------
+    
+
+    // MeshInstance3D* mesh_instance = nullptr;
+    // std::vector<CollisionShape3D*> box_collision_shapes;
+
+    Chunk() noexcept;
+    Chunk(const Chunk &chunk) :
+            grid_id(chunk.grid_id),
+            _is_free(false),
+            _rids(ChunkRIDs{ chunk._rids.mesh_instance_rid, chunk._rids.mesh_rid }),
+            koords(chunk.koords)
+    {
+        if (chunk.voxels) {
+            voxels = new VoxelData{*chunk.voxels};
+        }
+    }
+    ~Chunk() {
+        if (voxels) {
+            delete voxels;
+        }
+        // free_chunk_data(); // <- darf nur auf Mainthread aufgerufen werden
+    }
+
+    // void initialize_chunk(const Vector3i& local_position);
+
+    //TODO: diese Funktion wird nicht benutzt und sollte glaube ich auch nicht existieren!
+    void delete_data();
+
+    inline bool is_free() const {
+        return _is_free.load(std::memory_order_acquire);
+    }
+
+    inline void override(const Chunk &chunk) {
+        if (voxels) {
+            delete voxels;
+        }
+        voxels = chunk.voxels;
+        koords = chunk.koords;
+        grid_id = chunk.grid_id;
+        _is_free.store(false, std::memory_order_release);
+        _rids.mesh_instance_rid = chunk._rids.mesh_instance_rid;
+        _rids.mesh_rid = chunk._rids.mesh_rid;
+        _rids.mesh_rid = chunk._rids.mesh_rid;
+    }
+
+    // inline void override_rids(const RIDs &r) {
+    //     _rids.mesh_instance_rid = r.mesh_instance_rid;
+    //     _rids.mesh_rid = r.mesh_rid;
+    //     _rids.physics_body_rid = r.physics_body_rid;
+    //     _rids.col_shapes = r.col_shapes;
+    // }
+    inline void override_rids(const ChunkRIDs &r) {
+        _rids = r;
+    }
+    inline ChunkRIDs get_rids() const {
+        return _rids;
+    }
+    inline RID get_mesh_rid() const {
+        return _rids.mesh_rid;
+    }
+    inline RID get_instance_rid() const {
+        return _rids.mesh_instance_rid;
+    }
+
+    inline ChunkKey get_key() const {
+        return ChunkKey{koords,grid_id};
+    }
+    inline VoxelData* get_voxels() const {
+        return voxels;
+    }
+
+    void operator<<(VoxelData *content) {
+        _is_free.store(false, std::memory_order_release);
+        if (voxels) {
+            delete voxels;
+        }
+        voxels = content;
+    }
+    void operator<<(const ChunkKey &key) {
+        _is_free.store(false, std::memory_order_release);
+        koords = key.koords;
+        grid_id = key.grid_id;
+    }
+};
+
+inline bool operator==(const ChunkKey& key, const Chunk& chunk) {
+    return chunk.koords == key.koords && chunk.grid_id==key.grid_id;
+}
+
+inline void operator<<(ChunkKey& key, const Chunk& chunk) {
+    key.koords = chunk.koords, key.grid_id = chunk.grid_id;
+}
+
+
+
+template <typename T>
+class TaggedPointer {
+    static_assert(8 != alignof(T), "type T für TaggedPointer ungeeignet.");
+    uintptr_t ptr;
+    enum FLAGS : uintptr_t {
+        F1  = 0b001,
+        F2  = 0b010,
+        F3  = 0b100,
+        ALL = 0b111
+    };
+    
+public:
+    TaggedPointer(T* obj_ptr = nullptr) : ptr(reinterpret_cast<uintptr_t>(obj_ptr)) {}
+
+    bool get_f1() const {
+        return ptr & F1;
+    }
+    void set_f1() {
+        ptr |= F1;
+    }
+    void unset_f1() {
+        ptr &= ~F1;
+    }
+
+    bool get_f2() const {
+        return ptr & F2;
+    }
+    void set_f2() {
+        ptr |= F2;
+    }
+    void unset_f2() {
+        ptr &= ~F2;
+    }
+    
+
+    T& operator*() {
+        return *reinterpret_cast<T*>(ptr & ~ALL);
+    }
+    T* operator->() {
+        return reinterpret_cast<T*>(ptr & ~ALL);
+    }
+    operator T *() {
+        return reinterpret_cast<T*>(ptr & ~ALL);
+    }
+
+    const T& operator*() const {
+        return *reinterpret_cast<const T*>(ptr & ~ALL);
+    }
+    const T* operator->() const {
+        return reinterpret_cast<const T*>(ptr & ~ALL);
+    }
+    operator const T *() const {
+        return reinterpret_cast<const T*>(ptr & ~ALL);
+    }
+};
+
+
+
+
+
+/*
+
+    using ID = uint32_t; // BLOCK -> ID erlaubt ; ID -> BLOCK nicht erlaubt!
+    using HP = uint8_t;
+    
+
+        // --- Masks: ---
+        _IS_OPAK = 0b1,
+        _IS_SOLID = 0b110,
+        _IS_LIQUID = 0b100,
+        _IS_GAS = 0b010,
+        // --- Bit-Shifts: ---
+        // TODO: Bigendian und LittleEndian-system überprüfen
+        _HP_SHIFT = (sizeof(BLOCK_ID)-1)*8, // HP-Wert ist das most-significant Byte
+    
+
+
+    inline static bool is_invisible(const ID id) {
+        // momentan ist ausschließlich das Nichts unsichtbar
+        return Voxel(id).transparent;
+        // return id == BLOCK::NOTHING;
+    }
+    inline static bool is_opak(const ID id) {
+        return id & BLOCK_ID::_IS_OPAK;
+    }
+    inline static bool is_solid(const ID id) {
+        return (id & _IS_SOLID) == _IS_SOLID;
+    }
+    inline static bool is_liquid(const ID id) {
+        return (id & _IS_SOLID) == _IS_LIQUID;
+    }
+    inline static bool is_gas(const ID id) {
+        return (id & _IS_SOLID) == _IS_GAS;
+    }
+    inline static bool is_dust(const ID id) {
+        return (id & _IS_SOLID) == NOTHING;
+    }
+    inline static HP get_hp(const ID &id) {
+        return static_cast<HP>(id << _HP_SHIFT);
+    }
+    inline static void set_hp(ID &id, HP value) {
+        id &= static_cast<ID>(value) >> _HP_SHIFT;
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+static void load_chunk(LoadData& data, short x, short y, short z, const VoxelGrid *voxel_grid) {
+		// TODO: hier müsste jetzt ein Chunk geladen werden
+		VoxelData* voxel_data = new VoxelData();
+		// TODO: performanter ist es vieleicht ein Chunk-objekt auf den Stack zu legen und zumschluss 'unique' zu machen
+		ChunkBuilder::singleton->fill_whole_chunk_random(voxel_data, voxel_grid->noise,Vector3i(x,y,z));
+		Vector3i koords(x,y,z);
+		// DrawData:
+		Array mesh_data = ChunkBuilder::singleton->generate_mesh_data(voxel_data);
+		
+		LocalGameInstance::singleton->push_chunk(voxel_data,x,y,z,voxel_grid->instance_id);
+		auto chunk = LocalGameInstance::singleton->get_chunk(x,y,z,voxel_grid->instance_id);
+
+		data.transform = Transform3D{ Basis(), koords * CHUNK_SIZE * VOXEL_SIZE };
+		data.draw = DrawData{ mesh_data, chunk->mesh_rid };
+		data.instance = chunk->mesh_instance_rid;
+		// data.physics = PhysicsData{ {}, {}, {}, {} };
+		
+		// Collision:
+		// chunk->box_collision_shapes = ChunkBuilder::singleton->generate_collision(koords,chunk->get_data());
+		// in LocalGameInstance Speichern:
+		// LocalGameInstance::singleton->push_chunk(chunk,x,y,z,voxel_grid->instance_id);
+		// return LoadData{transform,mesh,instance,shapes,body};
+	}
+
+	static void unload_chunk(UnLoadData& data, short x, short y, short z, const VoxelGrid *voxel_grid) {
+		//TODO: diese Funktion ist proglematisch, da Chunk::free den Chunk freigibt, ohne das Mesh zu deaktivieren
+		data.chunk = LocalGameInstance::singleton->get_chunk(x, y, z, voxel_grid->instance_id);
+	}
+
+
+
+
+
+
+
+
+
+inline static size_t hash(const ChunkKey& key) {
+    size_t id_hash = std::hash<size_t>{}(key.grid_id);
+    return static_cast<size_t>(   key.x
+                                + key.y * MAX_GRID_SIZE
+                                + key.z * MAX_GRID_SIZE * MAX_GRID_SIZE)
+                                ^ id_hash;
+}
+
+template<typename Key, typename Data, size_t Hash(const Key&), size_t SIZE>
+class MyHashMap {
+	friend struct UnLoadData;
+	static_assert(0 < SIZE);
+
+	static constexpr ushort SEARCH_DEPTH = 13;
+	static constexpr ushort TRYS = 20;
+	size_t _occupancy = 0;
+	
+	std::array<Data, SIZE> data{};
+
+	inline static size_t hash(const Key& key) {
+		return Hash(key) % SIZE; // TODO: "Remainder by zero is undefined" vieleicht muss ich das verbessern, sollte aber eigentlich nie passieren
+	}
+	inline static void next_idx(ushort &count, size_t &idx, const Key &key) {
+		count += 1;
+		idx += count * 2 + key.x;
+		idx -= SIZE * (SIZE <= idx);
+	}
+
+public:
+	inline double get_occupancy_rate() {
+		return static_cast<double>(_occupancy) / static_cast<double>(SIZE);
+	}
+
+	Data *get(const Key &key) {
+		ushort count = 0;
+		size_t idx = hash(key);
+		while (count < SEARCH_DEPTH) {
+			if (key == data[idx] && !data[idx].is_free()) {
+				return &data[idx];
+			}
+			next_idx(count,idx,key);
+		}
+		return nullptr;
+	}
+
+	Data* remove(const Key &key) {
+		Data *d = get(key);
+		if (d) {
+			_occupancy -= 1;
+			d->free();
+		}
+		return d;
+	}
+	
+	void push(Key &&key, typename Data::Content *content) {
+		// TODO: dieser Teil erstmal ein workaround und zum sicher gehen:
+		if (SIZE * 0.8 < _occupancy) {
+			return; // mehr als 80% sollte nicht befüllt werden
+		}
+		// // überprüfen ob Chunk breits geladen ist
+		// if (auto r = get(key)) {
+		// 	return r; // TODO: sollte vor 'push' geprüft werden
+		// }
+
+		// austauschbare key Referenz erstellen
+		const Key *_key = &key;
+		Key moving_key{};
+		// Die RIDs des neuen Platzes müssen mit dem des Verschobenen Tauschen
+		Data* moving_data_ptr = nullptr;
+		Data* original_data = nullptr;
+		
+		// nutze loop für 'TRYS' viele Versuche einen Chunk unter zu bringen
+		ushort move_count = 0;
+		while (move_count < TRYS) {
+			// key zu index auflösen
+			size_t idx = hash(*_key);
+			// merke den ersten index, beim Scheitern wird diese Var. genutzt um das zuverschiebene Element zu bestimmen
+			size_t move_idx = idx;
+			// nutze loop um 'SEARCH_DEPTH' viele Kollisionen aufzulösen
+			ushort count = 0;
+			while (count < SEARCH_DEPTH) {
+				if (data[idx].is_free()) {
+					if (content) {
+                        data[idx] << content;
+					}
+					data[idx] << key;
+					_occupancy += 1;
+					if (moving_data_ptr) {
+						// Es wird ein Chunk verschoben, d.h. RIDs müssen übertragen werden
+						original_data->override_rids(data[idx]);
+						data[idx].override_rids(*moving_data_ptr);
+					}
+					return;
+                }
+                next_idx(count,idx,key);
+            }
+				
+			// Wenn nach 'SEARCH_DEPTH' Kollisionen kein Platz gefunden wurde: Chunk austauschen und neu Versuchen
+
+			// !!!!!!!!!!FEHLER!!!!!!!! Was ist mit den RIDs wenn getauscht wird?! RIDs müssen getauscht werden
+			//TODO: chunk heraus nehmen. Beim ersten mal an der ersten stelle, danach an der 2. und immer so weiter bis 'TRYS' (...dann weiß ich nicht mehr weiter... sollt aber nie passieren *ahem* *hust* *hust*)
+            // Daten des zu überschreibenen Chunks kopieren
+			Data moving_data{data[move_idx]};
+			moving_data_ptr = &moving_data;
+			original_data = &data[move_idx];
+			// Chunk, der keinen Platz gefunden hat, einsetzen (RIDs fehlen hier noch!)
+			data[move_idx] << content;
+            data[move_idx] << key;
+			// Funktion wiederholen, jetzt mit herausgepflückten Chunk und neuem key
+			moving_key << moving_data;
+			_key = &moving_key;
+			content = moving_data.data;
+
+			// move_count hochzählen
+			next_idx(move_count, move_idx, key);
+		}
+	}
+};
+
+
+
+
+bool operator==(const ChunkKey &c1, const ChunkKey &c2);
+struct Hash {
+	template <typename T>
+	size_t operator()(const T& key) const {
+		auto id_hash = std::hash<size_t>{}(key.node_id);
+		return static_cast<size_t>(key.x + key.y * MAX_GRID_SIZE + key.z * MAX_GRID_SIZE * MAX_GRID_SIZE) ^ id_hash;
+	}
+};
+
+inline Chunk *get_chunk(short x, short y, short z, uint64_t id) {
+		return chunks_with_voxeldata.at(ChunkKey{ x, y, z, id }).get();
+	}
+
+	inline void remove_chunk(short x, short y, short z, uint64_t id) {
+		auto it = chunks_with_voxeldata.find(ChunkKey{ x, y, z, id });
+		if (it != chunks_with_voxeldata.end()) {
+			// chunks_to_remove->push_back(std::move(it->second));
+			chunks_with_voxeldata.erase(it);
+		}
+	}
+
+	inline Chunk *find_chunk(short x, short y, short z, uint64_t id) {
+		return chunks_with_voxeldata.find(ChunkKey{ x, y, z, id })->second.get();
+	}
+
+	/// consums the chunk-pointer
+	inline void push_chunk(std::unique_ptr<Chunk> &chunk, short x, short y, short z, uint64_t id) {
+		//TODO: enum, der angibt, in welchen Zustand der Chunk erstellt werden soll (Col + Mesh)
+		//TODO: Wie kann es sein, dass ein Chunk gepusht wird, der schon vorhanden ist?!
+		if (chunks_with_voxeldata.find(ChunkKey{ x, y, z, id }) != chunks_with_voxeldata.end()) {
+			return;
+		}
+		// chunks_to_add->push_back(chunk.get());
+		chunks_with_voxeldata[ChunkKey{ x, y, z, id }] = std::move(chunk);
+	}
+
+
+
+
+
+
+template<typename Data, auto Func>
+class WorkerThread {
+    std::atomic_bool _terminate_thread = false;
+    std::atomic_bool _is_pending = false;
+    
+	StrongThreadData<Data> inside;
+	
+	void load_and_remove_chunks();
+	
+public:
+    std::thread thread;
+
+    inline void start(WeakThreadData<Data> &outside) {
+        if (thread.joinable()) {return;}
+		run_again(outside);
+        thread = std::thread([&]() {
+            while (!_terminate_thread) {
+                // Arbeiten
+                Func(inside); // <- "heavy work"
+				
+                // gebe Daten wieder frei
+                inside.dismiss(outside);
+
+                // warte auf reaktivierung...
+                do {
+                    _is_pending = true;
+                    while (_is_pending && !_terminate_thread) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(WORKER_THREAD_ACTUALISATION_TIME_INTERVALL));
+                    }
+                    // ...und darauf, dass inside erreichbar ist
+                } while (!inside && !_terminate_thread);
+            }
+            // thread terminiert
+        });
+    }
+
+    inline void terminate_thread() {
+        _terminate_thread = true;
+        if (thread.joinable()) {
+            thread.join();
+        }
+    }
+    inline void run_again(WeakThreadData<Data> &outside) {
+        // beschlagnahme daten
+        inside.absorb(outside);
+        // Vorab-Berechnung von Daten, die nur auf dem Main-Thread passieren können
+        for (auto &cg : *inside) {
+			// Node-Koordinaten berechnung
+			Vector3 local_player_pos = LocalGameInstance::singleton->get_player()->get_position() - cg->body_data.node->get_position();
+            // in chunks umrechnen
+			local_player_pos /= (CHUNK_SIZE * VOXEL_SIZE);
+            // 'floor' verwenden um negative koords richtig darzustellen (-0.5 -> -1) (0.5 -> 0)
+			cg->set_local_player_koords(local_player_pos.floor());
+        }
+        // Thread aktive machen
+        _is_pending = false;
+    }
+    inline bool is_ready_and_waiting() {
+        return _is_pending;
+	}
+	
+    ~WorkerThread() {terminate_thread();}
+};
+
+inline bool operator==(const ChunkKey& c1, const ChunkKey& c2)
+{
+	return (c1.x == c2.x) && (c1.y == c2.y) && (c1.z == c2.z) && (c1.grid_id == c2.grid_id);
+}
+
+
+
+
+
+
+
+
+
+
+
+#pragma region MyMacros
+#define CAT2(a, b) a##b
+
+#define MAKE_NEIGHBOR_FUNC(DIR, OPPOSITE, SITZE_AUF)                        \
+	inline void CAT2(SITZE_AUF, _to_##DIR)(Chunk *ich, const Chunk &du) {        \
+		if (du.neighbor_##DIR && du.neighbor_##DIR->neighbor_##SITZE_AUF) { \
+			auto &DIR = du.neighbor_##DIR->neighbor_##SITZE_AUF;          \
+			ich->neighbor_##DIR = DIR;                                    \
+			DIR->neighbor_##OPPOSITE = ich;                               \
+		}                                                                   \
+	}
+
+MAKE_NEIGHBOR_FUNC(east, west, top)
+MAKE_NEIGHBOR_FUNC(west, east, top)
+MAKE_NEIGHBOR_FUNC(south, north, top)
+MAKE_NEIGHBOR_FUNC(north, south, top)
+
+MAKE_NEIGHBOR_FUNC(east, west, bottom)
+MAKE_NEIGHBOR_FUNC(west, east, bottom)
+MAKE_NEIGHBOR_FUNC(south, north, bottom)
+MAKE_NEIGHBOR_FUNC(north, south, bottom)
+
+MAKE_NEIGHBOR_FUNC(top, bottom, east)
+MAKE_NEIGHBOR_FUNC(bottom, top, east)
+MAKE_NEIGHBOR_FUNC(south, north, east)
+MAKE_NEIGHBOR_FUNC(north, south, east)
+
+MAKE_NEIGHBOR_FUNC(top, bottom, west)
+MAKE_NEIGHBOR_FUNC(bottom, top, west)
+MAKE_NEIGHBOR_FUNC(south, north, west)
+MAKE_NEIGHBOR_FUNC(north, south, west)
+
+MAKE_NEIGHBOR_FUNC(east, west, south)
+MAKE_NEIGHBOR_FUNC(west, east, south)
+MAKE_NEIGHBOR_FUNC(top, bottom, south)
+MAKE_NEIGHBOR_FUNC(bottom, top, south)
+
+MAKE_NEIGHBOR_FUNC(east, west, north)
+MAKE_NEIGHBOR_FUNC(west, east, north)
+MAKE_NEIGHBOR_FUNC(top, bottom, north)
+MAKE_NEIGHBOR_FUNC(bottom, top, north)
+#pragma endregion
+
+switch (wall)
+    {
+    case TOP:
+        neighbor_bottom = &neighbor;
+        neighbor.neighbor_top = this;
+		top_to_east(this, neighbor);
+		top_to_west(this, neighbor);
+		top_to_south(this, neighbor);
+		top_to_north(this, neighbor);
+		break;
+	case BOTTOM:
+        neighbor_top = &neighbor;
+        neighbor.neighbor_bottom = this;
+		bottom_to_east(this, neighbor);
+		bottom_to_west(this, neighbor);
+		bottom_to_south(this, neighbor);
+		bottom_to_north(this, neighbor);
+        break;
+    case EAST:
+        neighbor_west = &neighbor;
+        neighbor.neighbor_east = this;
+		east_to_top(this, neighbor);
+		east_to_bottom(this, neighbor);
+		east_to_south(this, neighbor);
+		east_to_north(this, neighbor);
+        break;
+    case WEST:
+        neighbor_east = &neighbor;
+        neighbor.neighbor_west = this;
+		west_to_top(this, neighbor);
+		west_to_bottom(this, neighbor);
+		west_to_south(this, neighbor);
+		west_to_north(this, neighbor);
+        break;
+    case SOUTH:
+        neighbor_north = &neighbor;
+        neighbor.neighbor_south = this;
+		south_to_top(this, neighbor);
+		south_to_bottom(this, neighbor);
+		south_to_east(this, neighbor);
+		south_to_west(this, neighbor);
+        break;
+    case NORTH:
+        neighbor_south = &neighbor;
+        neighbor.neighbor_north = this;
+		north_to_top(this, neighbor);
+		north_to_bottom(this, neighbor);
+		north_to_east(this, neighbor);
+		north_to_west(this, neighbor);
+        break;
+
+    default:
+        break;
+    }
+
+
+
+
+*/
+
+
+
+
+
+
+/*
+
+void Chunk::_add_indices() noexcept {
+    // Polygon 1
+    _indices.append(0 + _vertice_count);
+    _indices.append(1 + _vertice_count);
+    _indices.append(2 + _vertice_count);
+    // Polygon 2
+    _indices.append(0 + _vertice_count);
+    _indices.append(2 + _vertice_count);
+    _indices.append(3 + _vertice_count);
+    _vertice_count += 4;
+}
+
+void Chunk::add_cube_mesh_at(const ID block_id, const ushort x, const ushort y, const ushort z) noexcept {
+	short x_offset = x - CHUNK_SIZE/2;
+    short y_offset = y - CHUNK_SIZE/2;
+    short z_offset = z - CHUNK_SIZE/2;
+
+    if (y+1 == CHUNK_SIZE) {
+        if (neighbor_top == nullptr || !is_opak(neighbor_top->data[x][0][z])) {
+            _create_face_top(block_id, x_offset, y_offset, z_offset);
+            _add_indices();
+        }
+    }
+    else if (!is_opak(data[x][y+1][z])) {
+        _create_face_top(block_id, x_offset, y_offset, z_offset);
+        _add_indices();
+    }
+    if (y == 0) {
+        if (neighbor_bottom == nullptr || !is_opak(neighbor_bottom->data[x][CHUNK_SIZE-1][z])) {
+            _create_face_bottom(block_id, x_offset, y_offset, z_offset);
+            _add_indices();
+        }
+    }
+    else if (!is_opak(data[x][y-1][z])) {
+        _create_face_bottom(block_id, x_offset, y_offset, z_offset);
+        _add_indices();
+    }
+    if (x+1 == CHUNK_SIZE) {
+        if (neighbor_east == nullptr || !is_opak(neighbor_east->data[0][y][z])) {
+            _create_face_east(block_id, x_offset, y_offset, z_offset);
+            _add_indices();
+        }
+    }
+    else if (!is_opak(data[x+1][y][z])) {
+        _create_face_east(block_id, x_offset, y_offset, z_offset);
+        _add_indices();
+    }
+    if (x == 0) {
+        if (neighbor_west == nullptr || !is_opak(neighbor_west->data[CHUNK_SIZE-1][y][z])) {
+            _create_face_west(block_id, x_offset, y_offset, z_offset);
+            _add_indices();
+        }
+    }
+    else if (!is_opak(data[x-1][y][z])) {
+        _create_face_west(block_id, x_offset, y_offset, z_offset);
+        _add_indices();
+    }
+    if (z+1 == CHUNK_SIZE) {
+        if (neighbor_south == nullptr || !is_opak(neighbor_south->data[x][y][0])) {
+            _create_face_south(block_id, x_offset, y_offset, z_offset);
+            _add_indices();
+        }
+    }
+    else if (!is_opak(data[x][y][z+1])) {
+        _create_face_south(block_id, x_offset, y_offset, z_offset);
+        _add_indices();
+    }
+    if (z == 0) {
+        if (neighbor_north == nullptr || !is_opak(neighbor_north->data[x][y][CHUNK_SIZE-1])) {
+            _create_face_north(block_id, x_offset, y_offset, z_offset);
+            _add_indices();
+        }
+    }
+    else if (!is_opak(data[x][y][z-1])) {
+        _create_face_north(block_id, x_offset, y_offset, z_offset);
+        _add_indices();
+    }
+}
+
+void Chunk::_create_face_top(const ID block_id, short x_offset, short y_offset, short z_offset) {
+    _vertices.append(Vector3(x_offset             , y_offset + VOXEL_SIZE, z_offset            ));// 0     0       1
+    _vertices.append(Vector3(x_offset + VOXEL_SIZE, y_offset + VOXEL_SIZE, z_offset            ));// 1
+    _vertices.append(Vector3(x_offset + VOXEL_SIZE, y_offset + VOXEL_SIZE, z_offset + VOXEL_SIZE));// 2
+    _vertices.append(Vector3(x_offset             , y_offset + VOXEL_SIZE, z_offset + VOXEL_SIZE));// 3     3       2
+
+    const auto [ x, y ] = get_texture_coords(block_id);
+    _uvs.append(Vector2(SCALE* x   , SCALE* y   ));
+    _uvs.append(Vector2(SCALE*(x+1), SCALE* y   ));
+    _uvs.append(Vector2(SCALE*(x+1), SCALE*(y+1)));
+    _uvs.append(Vector2(SCALE* x   , SCALE*(y+1)));
+}
+void Chunk::_create_face_bottom(const ID block_id, short x_offset, short y_offset, short z_offset) {
+    _vertices.append(Vector3(x_offset + VOXEL_SIZE, y_offset             , z_offset + VOXEL_SIZE));// 6     4       5
+    _vertices.append(Vector3(x_offset + VOXEL_SIZE, y_offset             , z_offset            ));// 5
+    _vertices.append(Vector3(x_offset             , y_offset             , z_offset            ));// 4
+    _vertices.append(Vector3(x_offset             , y_offset             , z_offset + VOXEL_SIZE));// 7     7       6
+    
+    const auto [ x, y ] = get_texture_coords(block_id);
+    _uvs.append(Vector2(SCALE* x   , SCALE* y   ));
+    _uvs.append(Vector2(SCALE*(x+1), SCALE* y   ));
+    _uvs.append(Vector2(SCALE*(x+1), SCALE*(y+1)));
+    _uvs.append(Vector2(SCALE* x   , SCALE*(y+1)));
+}
+void Chunk::_create_face_east(const ID block_id, short x_offset, short y_offset, short z_offset) {
+    _vertices.append(Vector3(x_offset + VOXEL_SIZE, y_offset + VOXEL_SIZE, z_offset            ));// 1
+    _vertices.append(Vector3(x_offset + VOXEL_SIZE, y_offset             , z_offset            ));// 5
+    _vertices.append(Vector3(x_offset + VOXEL_SIZE, y_offset             , z_offset + VOXEL_SIZE));// 6
+    _vertices.append(Vector3(x_offset + VOXEL_SIZE, y_offset + VOXEL_SIZE, z_offset + VOXEL_SIZE));// 2
+    
+    const auto [ x, y ] = get_texture_coords(block_id);
+    _uvs.append(Vector2(SCALE* x   , SCALE* y   ));
+    _uvs.append(Vector2(SCALE*(x+1), SCALE* y   ));
+    _uvs.append(Vector2(SCALE*(x+1), SCALE*(y+1)));
+    _uvs.append(Vector2(SCALE* x   , SCALE*(y+1)));
+}
+void Chunk::_create_face_west(const ID block_id, short x_offset, short y_offset, short z_offset) {
+    _vertices.append(Vector3(x_offset             , y_offset + VOXEL_SIZE, z_offset            ));// 0
+    _vertices.append(Vector3(x_offset             , y_offset + VOXEL_SIZE, z_offset + VOXEL_SIZE));// 3
+    _vertices.append(Vector3(x_offset             , y_offset             , z_offset + VOXEL_SIZE));// 7
+    _vertices.append(Vector3(x_offset             , y_offset             , z_offset            ));// 4
+    
+    const auto [ x, y ] = get_texture_coords(block_id);
+    _uvs.append(Vector2(SCALE* x   , SCALE* y   ));
+    _uvs.append(Vector2(SCALE*(x+1), SCALE* y   ));
+    _uvs.append(Vector2(SCALE*(x+1), SCALE*(y+1)));
+    _uvs.append(Vector2(SCALE* x   , SCALE*(y+1)));
+}
+void Chunk::_create_face_south(const ID block_id, short x_offset, short y_offset, short z_offset) {
+    _vertices.append(Vector3(x_offset             , y_offset + VOXEL_SIZE, z_offset + VOXEL_SIZE));// 3
+    _vertices.append(Vector3(x_offset + VOXEL_SIZE, y_offset + VOXEL_SIZE, z_offset + VOXEL_SIZE));// 2
+    _vertices.append(Vector3(x_offset + VOXEL_SIZE, y_offset             , z_offset + VOXEL_SIZE));// 6
+    _vertices.append(Vector3(x_offset             , y_offset             , z_offset + VOXEL_SIZE));// 7
+    
+    const auto [ x, y ] = get_texture_coords(block_id);
+    _uvs.append(Vector2(SCALE* x   , SCALE* y   ));
+    _uvs.append(Vector2(SCALE*(x+1), SCALE* y   ));
+    _uvs.append(Vector2(SCALE*(x+1), SCALE*(y+1)));
+    _uvs.append(Vector2(SCALE* x   , SCALE*(y+1)));
+}
+void Chunk::_create_face_north(const ID block_id, short x_offset, short y_offset, short z_offset) {
+    _vertices.append(Vector3(x_offset             , y_offset + VOXEL_SIZE, z_offset            ));// 0
+    _vertices.append(Vector3(x_offset             , y_offset             , z_offset            ));// 4
+    _vertices.append(Vector3(x_offset + VOXEL_SIZE, y_offset             , z_offset            ));// 5
+    _vertices.append(Vector3(x_offset + VOXEL_SIZE, y_offset + VOXEL_SIZE, z_offset            ));// 1
+
+    const auto [ x, y ] = get_texture_coords(block_id);
+    _uvs.append(Vector2(SCALE* x   , SCALE* y   ));
+    _uvs.append(Vector2(SCALE*(x+1), SCALE* y   ));
+    _uvs.append(Vector2(SCALE*(x+1), SCALE*(y+1)));
+    _uvs.append(Vector2(SCALE* x   , SCALE*(y+1)));
+}
+*/
+
+
+/*
+
+void VVG::Chunk::_create_mesh() {
+    faces.clear();
+    faces.reserve(16);
+    if (neighbor_north) {
+        short z = 0;
+		for (short x = 0; x < CHUNK_SIZE; ++x) {
+			for (short y = 0; y < CHUNK_SIZE; ++y) {
+                Vector2i begin_idx{ x, y };
+                Vector2i end_idx{ begin_idx.x + 1, begin_idx.y + 1 };
+                
+                bool south_invisible = is_invisible(data[begin_idx.x][begin_idx.y][z]);
+                bool north_invisible = is_invisible(neighbor_north->data[begin_idx.x][begin_idx.y][CHUNK_SIZE-1]);
+
+                if ((!south_invisible & north_invisible) && !is_in_face(begin_idx, end_idx)) {
+                    greedy_face_xy(begin_idx, end_idx, z);
+                    faces.push_back(Face{begin_idx,end_idx});
+                    y = end_idx.y - 1; // überspringe die nächsten Blöcke, die im Face sind
+                    _create_face_xy(data[x][y][z], begin_idx, end_idx, z, false);
+                }
+            }
+		}
+	} else {
+        short z = 0;
+        for (short x = 0; x < CHUNK_SIZE; ++x) {
+            for (short y = 0; y < CHUNK_SIZE; ++y) {
+                Vector2i begin_idx{ x, y };
+                Vector2i end_idx{ begin_idx.x + 1, begin_idx.y + 1 };
+    
+                if (!is_invisible(data[begin_idx.x][begin_idx.y][z]) && !is_in_face(begin_idx, end_idx)) {
+                    greedy_face_xy(begin_idx, end_idx, z);
+                    faces.push_back(Face{begin_idx,end_idx});
+                    y = end_idx.y - 1; // überspringe die nächsten Blöcke, die im Face sind
+                    _create_face_xy(data[x][y][z], begin_idx, end_idx, z, false);
+                }
+            }
+        }
+    }
+	for (short z = 1; z < CHUNK_SIZE; ++z) { // 1 bis CHUNK_SIZE
+        faces.clear();
+        faces.reserve(16);
+		for (short x = 0; x < CHUNK_SIZE; ++x) {
+            for (short y = 0; y < CHUNK_SIZE; ++y) {
+                Vector2i begin_idx{ x, y };
+				Vector2i end_idx{ begin_idx.x + 1, begin_idx.y + 1 };
+
+				bool south_invisible = is_invisible(data[begin_idx.x][begin_idx.y][z]);
+                bool north_invisible = is_invisible(data[begin_idx.x][begin_idx.y][z-1]);
+				if (!south_invisible & north_invisible && !is_in_face(begin_idx, end_idx)) {
+					greedy_face_xy(begin_idx, end_idx, z);
+                    faces.push_back(Face{begin_idx,end_idx});
+                    y = end_idx.y - 1; // überspringe die nächsten Blöcke, die im Face sind
+					_create_face_xy(data[x][y][z], begin_idx, end_idx, z, false);
+				}
+                if (!north_invisible & south_invisible && !is_in_face(begin_idx, end_idx)) {
+					greedy_face_xy(begin_idx, end_idx, z-1);
+                    faces.push_back(Face{begin_idx,end_idx});
+                    y = end_idx.y - 1; // überspringe die nächsten Blöcke, die im Face sind
+					_create_face_xy(data[x][y][z-1], begin_idx, end_idx, z+1, true);
+				}
+			}
+        }
+	}
+    faces.clear();
+    faces.reserve(16);
+    if (neighbor_south) {
+		short z = CHUNK_SIZE-1;
+		for (short x = 0; x < CHUNK_SIZE; ++x) {
+			for (short y = 0; y < CHUNK_SIZE; ++y) {
+                Vector2i begin_idx{ x, y };
+                Vector2i end_idx{ begin_idx.x + 1, begin_idx.y + 1 };
+                
+                bool south_invisible = !is_invisible(neighbor_south->data[begin_idx.x][begin_idx.y][0]);
+                bool north_invisible = is_invisible(data[begin_idx.x][begin_idx.y][z]);
+
+				if ((!north_invisible & south_invisible) && !is_in_face(begin_idx, end_idx)) {
+					greedy_face_xy(begin_idx, end_idx, z);
+                    faces.push_back(Face{begin_idx,end_idx});
+                    y = end_idx.y - 1; // überspringe die nächsten Blöcke, die im Face sind
+					_create_face_xy(data[x][y][z], begin_idx, end_idx, z+1, true);
+				}
+			}
+		}
+	} else {
+		short z = CHUNK_SIZE - 1;
+        for (short x = 0; x < CHUNK_SIZE; ++x) {
+            for (short y = 0; y < CHUNK_SIZE; ++y) {
+                Vector2i begin_idx{ x, y };
+                Vector2i end_idx{ begin_idx.x + 1, begin_idx.y + 1 };
+                
+                if (!is_invisible(data[begin_idx.x][begin_idx.y][z]) && !is_in_face(begin_idx, end_idx)) {
+                    greedy_face_xy(begin_idx, end_idx, z);
+                    faces.push_back(Face{begin_idx,end_idx});
+                    y = end_idx.y - 1; // überspringe die nächsten Blöcke, die im Face sind
+                    _create_face_xy(data[x][y][z], begin_idx, end_idx, z+1, true);
+                }
+            }
+        }
+    }
+
+
+    faces.clear();
+    faces.reserve(16);
+    if (neighbor_west) {
+        short x = 0;
+		for (short y = 0; y < CHUNK_SIZE; ++y) {
+			for (short z = 0; z < CHUNK_SIZE; ++z) {
+                Vector2i begin_idx{ y, z };
+                Vector2i end_idx{ begin_idx.x + 1, begin_idx.y + 1 };
+                
+                bool south_invisible = is_invisible(data[x][begin_idx.x][begin_idx.y]);
+                bool north_invisible = is_invisible(neighbor_west->data[CHUNK_SIZE-1][begin_idx.x][begin_idx.y]);
+
+                if ((!south_invisible & north_invisible) && !is_in_face(begin_idx, end_idx)) {
+                    greedy_face_yz(begin_idx, end_idx, x);
+                    faces.push_back(Face{begin_idx,end_idx});
+                    z = end_idx.y - 1; // überspringe die nächsten Blöcke, die im Face sind
+                    _create_face_yz(data[x][y][z], begin_idx, end_idx, x, false);
+                }
+            }
+		}
+	} else {
+        short x = 0;
+        for (short y = 0; y < CHUNK_SIZE; ++y) {
+            for (short z = 0; z < CHUNK_SIZE; ++z) {
+                Vector2i begin_idx{ y, z };
+                Vector2i end_idx{ begin_idx.x + 1, begin_idx.y + 1 };
+    
+                if (!is_invisible(data[x][begin_idx.x][begin_idx.y]) && !is_in_face(begin_idx, end_idx)) {
+                    greedy_face_yz(begin_idx, end_idx, x);
+                    faces.push_back(Face{begin_idx,end_idx});
+                    z = end_idx.y - 1; // überspringe die nächsten Blöcke, die im Face sind
+                    _create_face_yz(data[x][y][z], begin_idx, end_idx, x, false);
+                }
+            }
+        }
+    }
+	for (short x = 1; x < CHUNK_SIZE; ++x) { // 1 bis CHUNK_SIZE
+        faces.clear();
+        faces.reserve(16);
+		for (short y = 0; y < CHUNK_SIZE; ++y) {
+            for (short z = 0; z < CHUNK_SIZE; ++z) {
+                Vector2i begin_idx{ y, z };
+				Vector2i end_idx{ begin_idx.x + 1, begin_idx.y + 1 };
+
+				bool south_invisible = is_invisible(data[x][begin_idx.x][begin_idx.y]);
+                bool north_invisible = is_invisible(data[x-1][begin_idx.x][begin_idx.y]);
+				if (!south_invisible & north_invisible && !is_in_face(begin_idx, end_idx)) {
+					greedy_face_yz(begin_idx, end_idx, x);
+                    faces.push_back(Face{begin_idx,end_idx});
+                    z = end_idx.y - 1; // überspringe die nächsten Blöcke, die im Face sind
+					_create_face_yz(data[x][y][z], begin_idx, end_idx, x, false);
+				}
+                if (!north_invisible & south_invisible && !is_in_face(begin_idx, end_idx)) {
+					greedy_face_yz(begin_idx, end_idx, x-1);
+                    faces.push_back(Face{begin_idx,end_idx});
+                    z = end_idx.y - 1; // überspringe die nächsten Blöcke, die im Face sind
+					_create_face_yz(data[x-1][y][z], begin_idx, end_idx, x+1, true);
+				}
+			}
+        }
+	}
+    faces.clear();
+    faces.reserve(16);
+    if (neighbor_east) {
+		short x = CHUNK_SIZE - 1;
+		for (short y = 0; y < CHUNK_SIZE; ++y) {
+			for (short z = 0; z < CHUNK_SIZE; ++z) {
+                Vector2i begin_idx{ y, z };
+                Vector2i end_idx{ begin_idx.x + 1, begin_idx.y + 1 };
+                
+                bool north_invisible = !is_invisible(data[x][begin_idx.x][begin_idx.y]);
+                bool south_invisible = is_invisible(neighbor_east->data[0][begin_idx.x][begin_idx.y]);
+
+                if ((!north_invisible & south_invisible) && !is_in_face(begin_idx, end_idx)) {
+                    greedy_face_yz(begin_idx, end_idx, x);
+                    faces.push_back(Face{begin_idx,end_idx});
+                    z = end_idx.y - 1; // überspringe die nächsten Blöcke, die im Face sind
+                    _create_face_yz(data[x][y][z], begin_idx, end_idx, x+1, true);
+                }
+            }
+		}
+	} else {
+		short x = CHUNK_SIZE - 1;
+        for (short y = 0; y < CHUNK_SIZE; ++y) {
+            for (short z = 0; z < CHUNK_SIZE; ++z) {
+                Vector2i begin_idx{ y, z };
+                Vector2i end_idx{ begin_idx.x + 1, begin_idx.y + 1 };
+                
+                if (!is_invisible(data[x][begin_idx.x][begin_idx.y]) && !is_in_face(begin_idx, end_idx)) {
+                    greedy_face_yz(begin_idx, end_idx, x);
+                    faces.push_back(Face{begin_idx,end_idx});
+                    z = end_idx.y - 1; // überspringe die nächsten Blöcke, die im Face sind
+                    _create_face_yz(data[x][y][z], begin_idx, end_idx, x+1, true);
+                }
+            }
+        }
+    }
+
+
+    faces.clear();
+    faces.reserve(16);
+    if (neighbor_bottom) {
+        short y = 0;
+		for (short x = 0; x < CHUNK_SIZE; ++x) {
+			for (short z = 0; z < CHUNK_SIZE; ++z) {
+                Vector2i begin_idx{ x, z };
+                Vector2i end_idx{ begin_idx.x + 1, begin_idx.y + 1 };
+                
+                bool south_invisible = is_invisible(data[begin_idx.x][y][begin_idx.y]);
+                bool north_invisible = is_invisible(neighbor_bottom->data[begin_idx.x][CHUNK_SIZE-1][begin_idx.y]);
+
+                if ((!south_invisible & north_invisible) && !is_in_face(begin_idx, end_idx)) {
+                    greedy_face_xz(begin_idx, end_idx, y);
+                    faces.push_back(Face{begin_idx,end_idx});
+                    z = end_idx.y - 1; // überspringe die nächsten Blöcke, die im Face sind
+                    _create_face_xz(data[x][y][z], begin_idx, end_idx, y, true);
+                }
+            }
+		}
+	} else {
+        short y = 0;
+        for (short x = 0; x < CHUNK_SIZE; ++x) {
+            for (short z = 0; z < CHUNK_SIZE; ++z) {
+                Vector2i begin_idx{ x, z };
+                Vector2i end_idx{ begin_idx.x + 1, begin_idx.y + 1 };
+    
+                if (!is_invisible(data[begin_idx.x][y][begin_idx.y]) && !is_in_face(begin_idx, end_idx)) {
+                    greedy_face_xz(begin_idx, end_idx, y);
+                    faces.push_back(Face{begin_idx,end_idx});
+                    z = end_idx.y - 1; // überspringe die nächsten Blöcke, die im Face sind
+                    _create_face_xz(data[x][y][z], begin_idx, end_idx, y, true);
+                }
+            }
+        }
+    }
+	for (short y = 1; y < CHUNK_SIZE; ++y) { // 1 bis CHUNK_SIZE
+        faces.clear();
+        faces.reserve(16);
+		for (short x = 0; x < CHUNK_SIZE; ++x) {
+            for (short z = 0; z < CHUNK_SIZE; ++z) {
+                Vector2i begin_idx{ x, z };
+				Vector2i end_idx{ begin_idx.x + 1, begin_idx.y + 1 };
+
+				bool south_invisible = is_invisible(data[begin_idx.x][y][begin_idx.y]);
+                bool north_invisible = is_invisible(data[begin_idx.x][y-1][begin_idx.y]);
+				if (!south_invisible & north_invisible && !is_in_face(begin_idx, end_idx)) {
+					greedy_face_xz(begin_idx, end_idx, y);
+                    faces.push_back(Face{begin_idx,end_idx});
+                    z = end_idx.y - 1; // überspringe die nächsten Blöcke, die im Face sind
+					_create_face_xz(data[x][y][z], begin_idx, end_idx, y, true);
+				}
+                if (!north_invisible & south_invisible && !is_in_face(begin_idx, end_idx)) {
+					greedy_face_xz(begin_idx, end_idx, y-1);
+                    faces.push_back(Face{begin_idx,end_idx});
+                    z = end_idx.y - 1; // überspringe die nächsten Blöcke, die im Face sind
+					_create_face_xz(data[x][y-1][z], begin_idx, end_idx, y+1, false);
+				}
+			}
+        }
+	}
+    faces.clear();
+    faces.reserve(16);
+    if (neighbor_top) {
+		short y = CHUNK_SIZE - 1;
+		for (short x = 0; x < CHUNK_SIZE; ++x) {
+			for (short z = 0; z < CHUNK_SIZE; ++z) {
+                Vector2i begin_idx{ x, z };
+                Vector2i end_idx{ begin_idx.x + 1, begin_idx.y + 1 };
+                
+                bool north_invisible = !is_invisible(data[begin_idx.x][y][begin_idx.y]);
+                bool south_invisible = is_invisible(neighbor_top->data[begin_idx.x][0][begin_idx.y]);
+
+                if ((!north_invisible & south_invisible) && !is_in_face(begin_idx, end_idx)) {
+                    greedy_face_xz(begin_idx, end_idx, y);
+                    faces.push_back(Face{begin_idx,end_idx});
+                    z = end_idx.y - 1; // überspringe die nächsten Blöcke, die im Face sind
+                    _create_face_xz(data[x][y][z], begin_idx, end_idx, y+1, false);
+                }
+            }
+		}
+	} else {
+		short y = CHUNK_SIZE - 1;
+        for (short x = 0; x < CHUNK_SIZE; ++x) {
+            for (short z = 0; z < CHUNK_SIZE; ++z) {
+                Vector2i begin_idx{ x, z };
+                Vector2i end_idx{ begin_idx.x + 1, begin_idx.y + 1 };
+                
+                if (!is_invisible(data[begin_idx.x][y][begin_idx.y]) && !is_in_face(begin_idx, end_idx)) {
+                    greedy_face_xz(begin_idx, end_idx, y);
+                    faces.push_back(Face{begin_idx,end_idx});
+                    z = end_idx.y - 1; // überspringe die nächsten Blöcke, die im Face sind
+                    _create_face_xz(data[x][y][z], begin_idx, end_idx, y+1, false);
+                }
+            }
+        }
+    }
+
+    if (_vertices.size() == 0) {
+		return; // Chunks können komplett leer sein
+	}
+	Array mesh_data{};
+	mesh_data.resize(Mesh::ARRAY_MAX);
+
+    mesh_data[Mesh::ARRAY_VERTEX] = _vertices;
+    mesh_data[Mesh::ARRAY_TEX_UV] = _uvs;
+    mesh_data[Mesh::ARRAY_INDEX] = _indices;
+
+	Vector3 position = Vector3(
+			x_pos * CHUNK_SIZE * VOXEL_SIZE,
+			y_pos * CHUNK_SIZE * VOXEL_SIZE,
+			z_pos * CHUNK_SIZE * VOXEL_SIZE);
+
+	Ref<ArrayMesh> mesh;
+    mesh.instantiate();
+	mesh->add_surface_from_arrays(Mesh::PRIMITIVE_TRIANGLES, mesh_data);
+    mesh_instance->set_mesh(mesh);
+    
+    mesh_instance->set_position(position);
+}
+
+
+
+
+void VVG::Chunk::_create_face_xy(const ID block_id, const short x const short y, const const Vector2 &end, short z_offset, bool invert_normals) {
+	
+	_vertices.append(Vector3(begin.x, end.y  , z_offset) - OFFSET); // 0     0       1
+	_vertices.append(Vector3(begin.x, begin.y, z_offset) - OFFSET);// 1
+    _vertices.append(Vector3(end.x  , begin.y, z_offset) - OFFSET);// 2
+    _vertices.append(Vector3(end.x  , end.y  , z_offset) - OFFSET);// 3     3       2
+
+    const auto [ x, y ] = get_texture_coords(block_id);
+
+	_uvs.append(Vector2(SCALE* x   , SCALE* y   ));
+	_uvs.append(Vector2(SCALE*(x+1), SCALE* y   ));
+    _uvs.append(Vector2(SCALE*(x+1), SCALE*(y+1)));
+    _uvs.append(Vector2(SCALE* x   , SCALE*(y+1)));
+
+	_add_polygons(invert_normals);
+}
+void VVG::Chunk::_create_face_yz(const ID block_id, const short x const short y, const const Vector2 &end, short x_offset, bool invert_normals) {
+    _vertices.append(Vector3(x_offset, begin.x, end.y  ) - OFFSET);// 0     0       1
+    _vertices.append(Vector3(x_offset, begin.x, begin.y) - OFFSET);// 1
+    _vertices.append(Vector3(x_offset, end.x  , begin.y) - OFFSET);// 2
+    _vertices.append(Vector3(x_offset, end.x  , end.y  ) - OFFSET);// 3     3       2
+
+    const auto [ x, y ] = get_texture_coords(block_id);
+	
+    _uvs.append(Vector2(SCALE* x   , SCALE* y   ));
+    _uvs.append(Vector2(SCALE*(x+1), SCALE* y   ));
+    _uvs.append(Vector2(SCALE*(x+1), SCALE*(y+1)));
+    _uvs.append(Vector2(SCALE* x   , SCALE*(y+1)));
+
+	_add_polygons(invert_normals);
+}
+void VVG::Chunk::_create_face_xz(const ID block_id, const short x const short y, const const Vector2 &end, short y_offset, bool invert_normals) {
+    _vertices.append(Vector3(begin.x, y_offset, end.y  ) - OFFSET);// 0     0       1
+    _vertices.append(Vector3(begin.x, y_offset, begin.y) - OFFSET);// 1
+    _vertices.append(Vector3(end.x  , y_offset, begin.y) - OFFSET);// 2
+    _vertices.append(Vector3(end.x  , y_offset, end.y  ) - OFFSET);// 3     3       2
+
+    const auto [ x, y ] = get_texture_coords(block_id);
+
+	_uvs.append(Vector2(SCALE* x   , SCALE* y   ));
+	_uvs.append(Vector2(SCALE*(x+1), SCALE* y   ));
+    _uvs.append(Vector2(SCALE*(x+1), SCALE*(y+1)));
+    _uvs.append(Vector2(SCALE* x   , SCALE*(y+1)));
+
+	_add_polygons(invert_normals);
+}
+
+
+
+
+bool Chunk::is_in_box(const Vector3i& begin,const Vector3i& end) {
+	for (size_t i = 0; i < boxes.size(); ++i) {
+		if (
+            (boxes[i].begin.x <= begin.x) & (end.x <= boxes[i].end.x) &&
+            (boxes[i].begin.y <= begin.y) & (end.y <= boxes[i].end.y) &&
+            (boxes[i].begin.z <= begin.z) & (end.z <= boxes[i].end.z)
+        ) {
+			return true;
+		}
+	}
+	return false;
+}
+
+
+
+bool VVG::Chunk::is_in_face(const Vector2i &begin, const Vector2i &end) {
+	for (size_t i = 0; i < faces.size(); ++i) {
+		if (
+            (faces[i].begin.x <= begin.x) & (end.x <= faces[i].end.x) &&
+            (faces[i].begin.y <= begin.y) & (end.y <= faces[i].end.y)
+        ) {
+			return true;
+		}
+	}
+	return false;
+}
+
+
+
+*/
